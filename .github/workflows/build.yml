@@ -120,8 +120,12 @@ jobs:
           python3 - <<'PY'
           import io, os, re, sys, zipfile
 
-          # ① 源码侧：收集所有 import 的 media3 类（去掉内部类的 $ 后缀）
-          need = {}
+          # ① 源码侧：收集所有 import 的 media3 名字。四种写法要分清：
+          #    · 普通类      import a.b.C;              → 必须精确命中
+          #    · 内部类      import a.b.Outer.Inner;    → 字节码里叫 Outer$Inner，必须归一
+          #    · 静态成员    import static a.b.C.FIELD; → 末段是字段/方法不是类，只核到类为止
+          #    · 通配符      import a.b.*;              → 没有具体类名，只核这个包存不存在
+          need, wild = {}, {}
           for root, _, files in os.walk("app/src"):
               for f in files:
                   if not f.endswith(".java"):
@@ -129,8 +133,15 @@ jobs:
                   p = os.path.join(root, f)
                   txt = io.open(p, encoding="utf-8", errors="replace").read()
                   for m in re.finditer(
-                          r"^\s*import\s+(?:static\s+)?(androidx\.media3\.[\w.$]+)\s*;", txt, re.M):
-                      need.setdefault(m.group(1).split("$")[0], []).append(p)
+                          r"^\s*import\s+(static\s+)?(androidx\.media3\.[\w.$]+?)(\.\*)?\s*;",
+                          txt, re.M):
+                      is_static, name, star = m.group(1), m.group(2), m.group(3)
+                      name = name.replace("$", ".")
+                      if star:
+                          wild.setdefault(name, []).append(p)
+                      else:
+                          # 静态 import 末段可能是字段/方法 → 标记一下，下面放宽一级
+                          need.setdefault((name, bool(is_static)), []).append(p)
 
           # ② AAR 侧：汇总所有 classes.jar 里的类名
           have = set()
@@ -143,11 +154,25 @@ jobs:
                           with zipfile.ZipFile(io.BytesIO(z.read(n))) as j:
                               have |= {x[:-6].replace("/", ".")
                                        for x in j.namelist() if x.endswith(".class")}
+          # 字节码里内部类是 Outer$Inner，源码写的是 Outer.Inner —— 两边归一到点号再比
+          have |= {c.replace("$", ".") for c in have}
+
+          def hit(name, is_static):
+              if name in have:
+                  return True
+              if is_static:            # C.FIELD / C.method → 去掉末段再试
+                  return name.rsplit(".", 1)[0] in have
+              return False
 
           # R 类是构建时生成的（源码树里没有同名文件），按类名后缀放过
-          missing = {c: v for c, v in need.items()
-                     if c not in have and c.rsplit(".", 1)[-1] != "R"}
-          print(f"TV 源码引用 media3 类 {len(need)} 个；app/libs 提供 {len(have)} 个")
+          missing = {c: v for (c, s), v in need.items()
+                     if not hit(c, s) and c.rsplit(".", 1)[-1] != "R"}
+          for pkg, v in wild.items():   # 通配符：该包下有任意一个类就算命中
+              if not any(c == pkg or c.startswith(pkg + ".") for c in have):
+                  missing[pkg + ".*"] = v
+
+          print(f"TV 源码引用 media3 类 {len(need)} 个（另有通配符 import {len(wild)} 处）；"
+                f"app/libs 提供 {len(have)} 个类名")
           if missing:
               print("::error::以下类在 app/libs 的 AAR 里找不到 —— AAR 集合与这份源码不是同一版本")
               for c in sorted(missing):
