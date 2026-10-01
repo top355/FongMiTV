@@ -10,6 +10,18 @@ on:
     branches: [fongmi, main]
     tags: ['v*']          # 只写 branches 时推标签不触发；两类都要写才都触发
   workflow_dispatch:
+    inputs:
+      tv_ref:
+        # ⚠️ 别随手改成 fongmi/HEAD。2026-08-27 的 b9455fb（Integrate libass and advanced
+        #    subtitle controls）起，TV 源码开始 import androidx.media3.exoplayer.libass.*、
+        #    androidx.media3.ui.libass.*、SecondaryTextOutput/SecondaryTextTrackSelector、
+        #    DanmakuPlayerViewController —— 这些类在 FongMi/media 的所有公开分支里都不存在
+        #    （上游 media 仓库最后推送 2026-08-14，fongmi 分支 HEAD 停在 07-27）。
+        #    所以能编的最后一个提交是 b9455fb 的父提交 fe6a5b23（08-27）。
+        #    等哪天上游 media 更新了，把这个默认值换回 fongmi 分支即可。
+        description: 'TV 源码提交/分支（默认 = 与 7 月版 media3 兼容的最后一个提交）'
+        required: false
+        default: 'fe6a5b235477c02633cf3bc50d4cd83414a521b4'
 
 permissions:
   contents: write         # 发 Release 必须显式给，否则报 403 Resource not accessible
@@ -27,8 +39,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出源码
+      - name: 检出源码（默认钉在最后一个媒体3兼容提交上，见 workflow 顶部说明）
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tv_ref || 'fe6a5b235477c02633cf3bc50d4cd83414a521b4' }}
 
       # ⚠️ 必须在任何 ./gradlew 之前跑完。
       #    Windows 上 git 默认 core.fileMode=false，提交上去的 gradlew 记录的是 644；
@@ -94,6 +108,55 @@ jobs:
           fi
           echo "OK：20 个播放器 AAR 齐全"
           ls -l app/libs/*.aar | awk '{print $5, $9}'
+
+      # ⚠️ 让「AAR 与源码版本错配」在 10 秒内暴露，而不是编到 1 分钟后甩出几十条
+      #    "package androidx.media3.exoplayer.libass does not exist" 让你猜。
+      #    原理：TV 源码里出现的每个 import androidx.media3.* 都要能在 app/libs 的 AAR 里找到。
+      #    实测撞到过：TV 的 b9455fb(2026-08-27) 引入 libass 等 8 个新类，而上游 media 仓库
+      #    最后推送是 2026-08-14 —— 版本对不上，编译必红（见 README §4.9）。
+      - name: 校验 AAR 是否覆盖 TV 源码用到的 media3 类（版本错配防呆）
+        run: |
+          set -e
+          python3 - <<'PY'
+          import io, os, re, sys, zipfile
+
+          # ① 源码侧：收集所有 import 的 media3 类（去掉内部类的 $ 后缀）
+          need = {}
+          for root, _, files in os.walk("app/src"):
+              for f in files:
+                  if not f.endswith(".java"):
+                      continue
+                  p = os.path.join(root, f)
+                  txt = io.open(p, encoding="utf-8", errors="replace").read()
+                  for m in re.finditer(
+                          r"^\s*import\s+(?:static\s+)?(androidx\.media3\.[\w.$]+)\s*;", txt, re.M):
+                      need.setdefault(m.group(1).split("$")[0], []).append(p)
+
+          # ② AAR 侧：汇总所有 classes.jar 里的类名
+          have = set()
+          for a in sorted(os.listdir("app/libs")):
+              if not a.endswith(".aar"):
+                  continue
+              with zipfile.ZipFile("app/libs/" + a) as z:
+                  for n in z.namelist():
+                      if n == "classes.jar":
+                          with zipfile.ZipFile(io.BytesIO(z.read(n))) as j:
+                              have |= {x[:-6].replace("/", ".")
+                                       for x in j.namelist() if x.endswith(".class")}
+
+          # R 类是构建时生成的（源码树里没有同名文件），按类名后缀放过
+          missing = {c: v for c, v in need.items()
+                     if c not in have and c.rsplit(".", 1)[-1] != "R"}
+          print(f"TV 源码引用 media3 类 {len(need)} 个；app/libs 提供 {len(have)} 个")
+          if missing:
+              print("::error::以下类在 app/libs 的 AAR 里找不到 —— AAR 集合与这份源码不是同一版本")
+              for c in sorted(missing):
+                  print(f"  x {c}   <- {missing[c][0]}")
+              print("多半是 TV 源码比 media 分支新（上游没公开配套 media3）。")
+              print("把 workflow 顶部 tv_ref 换成更早的提交，或等上游 media 更新。")
+              sys.exit(1)
+          print("OK：TV 源码用到的 media3 类在 AAR 里全部命中")
+          PY
 
       - name: JDK 21
         uses: actions/setup-java@v5
