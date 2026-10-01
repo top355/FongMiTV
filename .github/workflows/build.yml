@@ -1,0 +1,186 @@
+# 放到 top355/FongMiTV 分叉的 .github/workflows/build.yml
+# AAR 来源三选一，脚本会自动判断，不用你改：
+#   1) app/libs 里已经自带（git add -f 提交进去的）→ 直接用
+#   2) 没有 → 从下面 MEDIA_REPO 的 Release 资产 media3-aars.zip 下载（默认 <你的用户名>/media）
+#   3) 想换来源 → 在仓库 Settings → Variables 里加 MEDIA_REPO=<owner>/<repo>
+name: Build FongMi TV APK
+
+on:
+  push:
+    branches: [fongmi, main]
+    tags: ['v*']          # 只写 branches 时推标签不触发；两类都要写才都触发
+  workflow_dispatch:
+
+permissions:
+  contents: write         # 发 Release 必须显式给，否则报 403 Resource not accessible
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 20 个播放器 AAR 从哪来。默认取「你自己的 media 分叉」的同名仓库。
+  # 内置 media 的 Release 资产名固定是 media3-aars.zip，标签固定是 libs（由 build-aars.yml 产出）。
+  MEDIA_REPO: ${{ vars.MEDIA_REPO || format('{0}/media', github.repository_owner) }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v5
+
+      - name: 环境自检（gradle.properties 不许出现本机绝对路径）
+        run: |
+          set -e
+          if grep -nE '^[[:space:]]*[^#[:space:]][^=]*=[[:space:]]*[A-Za-z]:[\\/]' gradle.properties; then
+            echo "::error::gradle.properties 里有 Windows 专属绝对路径，Linux runner 上 gradle 会立刻退出 1"
+            exit 1
+          fi
+          echo "wrapper: $(grep distributionUrl gradle/wrapper/gradle-wrapper.properties)"
+          echo "gradlew 可执行位: $(stat -c '%A' gradlew)"
+
+      # app/libs/.gitignore 里那一行 lib-*.aar 把这些 AAR 全挡在仓库外了，所以要么提交进去（-f），要么在这里拉。
+      - name: 取回播放器 AAR（来自 media 分叉的 Release 资产）
+        run: |
+          set -e
+          if [ -f app/libs/lib-common-release.aar ]; then
+            echo "app/libs 已自带 AAR，跳过下载"
+            exit 0
+          fi
+          URL="https://github.com/$MEDIA_REPO/releases/download/libs/media3-aars.zip"
+          echo "下载 $URL"
+          curl -fL --retry 3 --retry-delay 5 --max-time 600 -o "$RUNNER_TEMP/media3-aars.zip" "$URL"
+          python3 - <<'PY'
+          import zipfile, os
+          os.makedirs("app/libs", exist_ok=True)
+          z = zipfile.ZipFile(os.environ["RUNNER_TEMP"] + "/media3-aars.zip")
+          z.extractall("app/libs")
+          print("解出", len(z.namelist()), "个文件")
+          PY
+          ls -l app/libs/*.aar | awk '{printf "%8.1f MB  %s\n", $5/1048576, $9}'
+
+      - name: 缓存 AAR（约 120 MB；缓存挂了不影响构建）
+        continue-on-error: true
+        uses: actions/cache@v5
+        with:
+          path: app/libs
+          key: media3-aars-${{ env.MEDIA_REPO }}-${{ github.run_id }}
+          restore-keys: |
+            media3-aars-${{ env.MEDIA_REPO }}-
+
+      - name: 校验播放器 AAR 是否齐全（缺一个都编不过，早失败早明白）
+        run: |
+          set -e
+          need="lib-common lib-container lib-database lib-datasource lib-datasource-okhttp lib-datasource-rtmp lib-decoder lib-decoder-ffmpeg lib-decoder-mpegh lib-effect lib-exoplayer lib-exoplayer-dash lib-exoplayer-hls lib-exoplayer-rtsp lib-exoplayer-smoothstreaming lib-extractor lib-mpvplayer lib-session lib-ui lib-ui-danmaku"
+          miss=""
+          for n in $need; do
+            [ -f "app/libs/$n-release.aar" ] || miss="$miss $n"
+          done
+          if [ -n "$miss" ]; then
+            echo "::error::app/libs 缺少播放器依赖:$miss"
+            echo "两个可能：① 上一步下载失败（$MEDIA_REPO 的 Release 里还没有 media3-aars.zip）；"
+            echo "② 下载到的 AAR 集合太老/太新，模块名对不上这份源码。"
+            echo "修法见 README 的 B 路线：先在 media 分叉里跑 build-aars.yml，再回来跑这个。"
+            exit 1
+          fi
+          echo "OK：20 个播放器 AAR 齐全"
+          ls -l app/libs/*.aar | awk '{print $5, $9}'
+
+      - name: JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Chaquopy 17 起 buildPython 必须与 app 的 python 版本 major.minor 一致（chaquo/build.gradle 里是 3.10）
+      - name: Python 3.10
+        uses: actions/setup-python@v6        # v6 = 首个 node24（已核对 action.yml 的 runs.using）
+        with:
+          python-version: '3.10'
+      - name: 确认 Chaquopy 能找到匹配的 build Python
+        run: |
+          set -e
+          python3 --version
+          python3.10 --version 2>/dev/null || echo "无 python3.10 命令 → Chaquopy 会退回 python3（同样是 3.10）"
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: 安装 Android SDK（compileSdk 37 / build-tools 37.0.0）
+        run: |
+          set -e
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMGR" ] || SDKMGR="$(command -v sdkmanager)"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" "platform-tools" "platforms;android-37" "build-tools;37.0.0"
+          ls "$ANDROID_HOME/build-tools"
+
+      # app/build.gradle 在【配置阶段】就 file('local.properties') 读签名，文件缺失或字段为空连 debug 都配置不过
+      - name: 生成 CI 签名与 local.properties
+        run: |
+          set -e
+          keytool -genkeypair -keystore "$RUNNER_TEMP/ci.jks" -storetype PKCS12 \
+            -alias ci -keyalg RSA -keysize 2048 -validity 3650 \
+            -storepass android123 -keypass android123 \
+            -dname "CN=CI, OU=CI, O=CI, L=CI, S=CI, C=CN"
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo "storeFile=$RUNNER_TEMP/ci.jks"
+            echo "keyAlias=ci"
+            echo "storePassword=android123"
+          } > local.properties
+          sed 's/android123/******/' local.properties
+
+      - name: 编译（TV 版 + 手机版，按 ABI 分包）
+        run: |
+          set -e
+          # lintVital 带 flavor 名，任务名不确定 → 先问它是谁，再决定跳哪些（-x 写错名字会报 Task not found）
+          ./gradlew :app:tasks --all --console=plain -q \
+            | grep -oE 'lintVital[A-Za-z]*Release' | sort -u | sed 's/^/-x /' | tr '\n' ' ' > /tmp/skip.txt
+          echo "跳过：$(cat /tmp/skip.txt)"
+          ./gradlew :app:assembleLeanbackRelease :app:assembleMobileRelease \
+            $(cat /tmp/skip.txt) --no-daemon --console=plain
+
+      - name: 清点产物
+        run: |
+          set -e
+          ls -l Release/apk
+          sha256sum Release/apk/*.apk | tee Release/apk/SHA256SUMS.txt
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: fongmitv-apk
+          path: |
+            Release/apk/*.apk
+            Release/apk/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: 推标签时发布到 Releases（幂等）
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          {
+            echo "## $TAG"
+            echo
+            echo '```'
+            cat Release/apk/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo "- 构建提交: $GITHUB_SHA"
+          } > /tmp/notes.md
+          ASSETS=""
+          for f in Release/apk/leanback-arm64_v8a.apk Release/apk/leanback-armeabi_v7a.apk \
+                   Release/apk/mobile-arm64_v8a.apk Release/apk/mobile-armeabi_v7a.apk; do
+            [ -f "$f" ] && ASSETS="$ASSETS $f"
+          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $ASSETS --clobber      # create 没有 --clobber，已存在只能走 upload
+            gh release edit "$TAG" --title "$TAG" --notes-file /tmp/notes.md
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file /tmp/notes.md $ASSETS
+          fi
