@@ -30,15 +30,23 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v5
 
-      - name: 环境自检（gradle.properties 不许出现本机绝对路径）
+      # ⚠️ 必须在任何 ./gradlew 之前跑完。
+      #    Windows 上 git 默认 core.fileMode=false，提交上去的 gradlew 记录的是 644；
+      #    Linux runner 上直接 ./gradlew 就是「Permission denied」→ 步骤退出码 126。
+      - name: 环境自检（gradlew 可执行位 + gradle.properties 不许出现本机绝对路径）
         run: |
           set -e
+          # 想在仓库层面根治（一次就够，之后 clone 下来就带可执行位）：
+          #   git update-index --chmod=+x gradlew && git commit -m "gradlew +x"
+          # 下面这行是兜底，确保即使仓库里仍是 644 也能跑。
+          [ -f gradlew ] || { echo "::error::仓库根目录没有 gradlew"; exit 1; }
+          chmod +x gradlew
+          echo "gradlew 权限: $(stat -c '%A' gradlew)（必须是 rwx 开头）"
           if grep -nE '^[[:space:]]*[^#[:space:]][^=]*=[[:space:]]*[A-Za-z]:[\\/]' gradle.properties; then
             echo "::error::gradle.properties 里有 Windows 专属绝对路径，Linux runner 上 gradle 会立刻退出 1"
             exit 1
           fi
           echo "wrapper: $(grep distributionUrl gradle/wrapper/gradle-wrapper.properties)"
-          echo "gradlew 可执行位: $(stat -c '%A' gradlew)"
 
       # app/libs/.gitignore 里那一行 lib-*.aar 把这些 AAR 全挡在仓库外了，所以要么提交进去（-f），要么在这里拉。
       - name: 取回播放器 AAR（来自 media 分叉的 Release 资产）
@@ -170,12 +178,15 @@ jobs:
       - name: 编译（TV 版 + 手机版，按 ABI 分包）
         run: |
           set -e
+          chmod +x ./gradlew          # 每个 step 是独立 shell，这里再兜一次底（幂等；根治看上面「环境自检」）
+          ./gradlew --version         # 权限 / CRLF / 缺解释器都在这一行炸，报错比在管道里看得清
           # lintVital 带 flavor 名，任务名不确定 → 先问它是谁，再决定跳哪些（-x 写错名字会报 Task not found）
-          ./gradlew :app:tasks --all --console=plain -q \
-            | grep -oE 'lintVital[A-Za-z]*Release' | sort -u | sed 's/^/-x /' | tr '\n' ' ' > /tmp/skip.txt
-          echo "跳过：$(cat /tmp/skip.txt)"
+          # 探测失败不算错误：grep 没匹配到时返回 1，不该拖垮整个构建（-x 只是省时间的优化）
+          { ./gradlew :app:tasks --all --console=plain -q \
+              | grep -oE 'lintVital[A-Za-z]*Release' | sort -u | sed 's/^/-x /' | tr '\n' ' ' > /tmp/skip.txt ; } || true
+          echo "跳过：$(cat /tmp/skip.txt 2>/dev/null)"
           ./gradlew :app:assembleLeanbackRelease :app:assembleMobileRelease \
-            $(cat /tmp/skip.txt) --no-daemon --console=plain
+            $(cat /tmp/skip.txt 2>/dev/null) --no-daemon --console=plain
 
       - name: 清点产物
         run: |
