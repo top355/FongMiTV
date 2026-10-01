@@ -107,14 +107,49 @@ jobs:
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v5
 
-      - name: 安装 Android SDK（compileSdk 37 / build-tools 37.0.0）
+      # ⚠️ 平台包名不能写死：API 37 起 Google 强制带次版本号，官方仓库里只有
+      #    platforms;android-37.0 / 37.1 / 37.2，【没有 platforms;android-37】——
+      #    写 android-37 会直接报 "Failed to find package 'platforms;android-37'"。
+      #    36 及以前是不带小数的老编号（platforms;android-36 才有）。
+      #    所以这里从工程自己的 libs.versions.toml 读 compileSdk，再按编号规则试候选。
+      - name: 安装 Android SDK（平台包名按编号规则解析，不写死）
         run: |
           set -e
+          CS=$(grep -m1 -E '^compileSdk(Version)?[[:space:]]*=' gradle/libs.versions.toml | grep -oE '[0-9]+' | head -1)
+          test -n "$CS" || { echo "::error::没从 gradle/libs.versions.toml 读到 compileSdk"; exit 1; }
+          echo "工程 compileSdk = $CS"
           SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKMGR" ] || SDKMGR="$(command -v sdkmanager)"
+          echo "sdkmanager: $SDKMGR"
+
+          # 'yes: standard output: Broken pipe' 是正常现象（sdkmanager 收够 y 就退出了），不是错误
           yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
-          "$SDKMGR" "platform-tools" "platforms;android-37" "build-tools;37.0.0"
-          ls "$ANDROID_HOME/build-tools"
+          "$SDKMGR" "platform-tools" > /dev/null 2>&1 || true
+
+          # 37 起是新编号（带 .0），36 及以前是老编号（不带）→ 先试更可能的那个，装不上再试另一个。
+          # 判据一律看目录在不在（sdkmanager 的退出码不完全可靠）。
+          if [ "$CS" -ge 37 ] 2>/dev/null; then
+            CANDS="platforms;android-$CS.0 platforms;android-$CS"
+          else
+            CANDS="platforms;android-$CS platforms;android-$CS.0"
+          fi
+          PLAT=""
+          for cand in $CANDS; do
+            "$SDKMGR" "$cand" > /dev/null 2>&1 || true
+            if ls -d "$ANDROID_HOME/platforms/android-$CS"* > /dev/null 2>&1; then PLAT="$cand"; break; fi
+            echo "  ⚠️ $cand 装不上，换下一个候选"
+          done
+          if [ -z "$PLAT" ]; then
+            echo "::error::API $CS 的平台装不上（候选都试过了）"
+            echo "platforms/ 目录里现在有："; ls "$ANDROID_HOME/platforms" || true
+            exit 1
+          fi
+          echo "✅ 平台包 $PLAT 已就绪"
+          echo "--- platforms ---"; ls "$ANDROID_HOME/platforms"
+
+          # build-tools 交给 AGP 兜底：这边装不上只当警告，AGP 会自己下它需要的那个版本
+          "$SDKMGR" "build-tools;$CS.0.0" > /dev/null 2>&1 || true
+          echo "--- build-tools ---"; ls "$ANDROID_HOME/build-tools"
 
       # app/build.gradle 在【配置阶段】就 file('local.properties') 读签名，文件缺失或字段为空连 debug 都配置不过
       - name: 生成 CI 签名与 local.properties
